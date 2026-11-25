@@ -183,28 +183,41 @@ BEGIN
 END;
 $$;
 
-CREATE EXTENSION IF NOT EXISTS pg_cron;
 
-SELECT cron.schedule('q4_refresh_clinic_summary', '0 1 * * *',
-                     $$CALL q4_clinic.pr_refresh_clinic_summary(CURRENT_DATE - 1)$$);
+-- Safe scheduling: runs only if pg_cron is available on this server.
+-- If it is not installed you will just see a NOTICE and the rest of the script still works.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_cron') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_cron;
+        PERFORM cron.schedule('q4_refresh_clinic_summary', '0 1 * * *', $cmd$CALL q4_clinic.pr_refresh_clinic_summary(CURRENT_DATE - 1)$cmd$);
+        RAISE NOTICE 'Job q4_refresh_clinic_summary scheduled: 0 1 * * *';
+    ELSE
+        RAISE NOTICE 'pg_cron is not installed on this server - job NOT scheduled. Schedule used: 0 1 * * *';
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Could not schedule job (q4_refresh_clinic_summary): %', SQLERRM;
+END
+$do$;
 
-SELECT jobid, jobname, schedule, command, active FROM cron.job WHERE jobname = 'q4_refresh_clinic_summary';
+-- Inspect job / history (uncomment where pg_cron is installed):
+-- SELECT jobid, jobname, schedule, command, active FROM cron.job WHERE jobname = 'q4_refresh_clinic_summary';
 -- SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10;
 
 -- =====================================================================
 -- TESTS / EVIDENCE
 -- =====================================================================
-\echo '--- (a) Data ---'
+SELECT '--- (a) Data ---' AS section;
 SELECT * FROM appointments ORDER BY appointment_id;
 
-\echo '--- (b) Function ---'
+SELECT '--- (b) Function ---' AS section;
 SELECT fn_daily_load(1, CURRENT_DATE) AS doctor1_today;          -- 2
 SELECT fn_daily_load(3, CURRENT_DATE - 1) AS cancelled_not_counted; -- 0
 SELECT fn_daily_load(1, CURRENT_DATE + 30) AS no_bookings;       -- 0
 DO $$ BEGIN PERFORM fn_daily_load(999, CURRENT_DATE);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (unknown doctor): %', SQLERRM; END $$;
 
-\echo '--- (c) Procedure ---'
+SELECT '--- (c) Procedure ---' AS section;
 CALL pr_book_appointment(3, 1, CURRENT_DATE, '11:00');           -- valid
 DO $$ BEGIN CALL pr_book_appointment(99, 1, CURRENT_DATE, '11:00');
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (patient): %', SQLERRM; END $$;
@@ -215,7 +228,7 @@ DO $$ BEGIN CALL pr_book_appointment(1, 2, CURRENT_DATE - 1, '10:00');
 DO $$ BEGIN CALL pr_book_appointment(1, 2, CURRENT_DATE, '13:00');
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (bad slot): %', SQLERRM; END $$;
 
-\echo '--- (d) Trigger: clash on INSERT, clash on UPDATE, self-update allowed ---'
+SELECT '--- (d) Trigger: clash on INSERT, clash on UPDATE, self-update allowed ---' AS section;
 DO $$ BEGIN CALL pr_book_appointment(2, 1, CURRENT_DATE, '09:00');  -- doctor 1 already has 09:00 today
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (insert clash): %', SQLERRM; END $$;
 DO $$ BEGIN UPDATE appointments SET slot_time = '09:00' WHERE appointment_id = 2;  -- moves onto appt 1
@@ -224,15 +237,15 @@ UPDATE appointments SET status = 'BOOKED' WHERE appointment_id = 1;  -- allowed:
 -- A cancelled slot can be booked again:
 CALL pr_book_appointment(1, 3, CURRENT_DATE + 1, '09:00');
 
-\echo '--- (e) View ---'
+SELECT '--- (e) View ---' AS section;
 SELECT * FROM v_today_appointments ORDER BY slot_time;
 
-\echo '--- (f) EXPLAIN ---'
+SELECT '--- (f) EXPLAIN ---' AS section;
 SET enable_seqscan = off;
 EXPLAIN SELECT * FROM appointments WHERE appointment_day = CURRENT_DATE AND doctor_id = 1;
 RESET enable_seqscan;
 
-\echo '--- (g) Run twice: summary replaced, not duplicated ---'
+SELECT '--- (g) Run twice: summary replaced, not duplicated ---' AS section;
 CALL pr_refresh_clinic_summary(CURRENT_DATE - 1);                -- booked 0, attended 1, cancelled 1
 SELECT * FROM clinic_summary;
 CALL pr_refresh_clinic_summary(CURRENT_DATE - 1);
